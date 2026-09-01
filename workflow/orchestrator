@@ -1,0 +1,144 @@
+"""
+Orchestrator — runs the full handoff chain:
+
+    Planner -> Research -> Domain Expert -> Execution
+        -> [HUMAN APPROVAL] -> Reviewer (retry loop) -> Report Generator
+        -> [HUMAN APPROVAL] -> Notification dispatch
+
+Each step is a separate `Runner.run()` call against a single specialist
+agent (rather than one long multi-agent `handoff()` chain the model
+navigates itself) so that:
+  - every intermediate result is captured in SharedContext and can be
+    logged/audited,
+  - the human-approval gates are guaranteed to run at fixed points instead
+    of depending on the model choosing to hand off correctly.
+
+This is the more controllable of the two patterns the OpenAI Agents SDK
+supports. If you want the model itself to decide handoff routing, wire the
+same agents together with `agents.handoff()` and give a triage agent all six
+as handoff targets instead of calling Runner.run per stage below.
+"""
+from __future__ import annotations
+import json
+from agents import Runner
+
+from memory.shared_memory import SharedContext
+from models.schemas import TaskPlan, ResearchFindings, DomainAnalysis, ExecutionResult, ReviewResult, ExecutiveReport
+from specialists.planner_agent import planner_agent
+from specialists.research_agent import research_agent
+from specialists.domain_expert_agent import domain_expert_agent
+from specialists.execution_agent import execution_agent
+from specialists.reviewer_agent import reviewer_agent
+from specialists.report_generator_agent import report_generator_agent
+from tools.notification_tool import send_notification
+import config
+
+
+def human_approval_gate(ctx: SharedContext, gate_name: str, summary: str) -> bool:
+    """Blocking CLI approval prompt. Swap this for a webhook/UI callback in
+    production — the contract is simply: return True/False and record it."""
+    print("\n" + "=" * 70)
+    print(f"HUMAN APPROVAL REQUIRED: {gate_name}")
+    print("=" * 70)
+    print(summary)
+    answer = input("\nApprove? [y/N]: ").strip().lower()
+    approved = answer == "y"
+    ctx.record_approval(gate_name, approved)
+    return approved
+
+
+def run_pipeline(goal: str) -> SharedContext:
+    ctx = SharedContext(goal=goal)
+    ctx.log("orchestrator", "run_started", goal)
+
+    # 1. Planner
+    result = Runner.run_sync(planner_agent, goal, context=ctx)
+    ctx.task_plan = result.final_output_as(TaskPlan)
+    ctx.log("planner_agent", "task_plan_created", f"{len(ctx.task_plan.tasks)} tasks")
+
+    # 2. Research
+    research_prompt = (
+        f"Business goal: {goal}\n\nTaskPlan:\n{ctx.task_plan.model_dump_json(indent=2)}\n\n"
+        "Focus on the tasks with owner_agent == 'research'."
+    )
+    result = Runner.run_sync(research_agent, research_prompt, context=ctx)
+    ctx.research = result.final_output_as(ResearchFindings)
+    ctx.log("research_agent", "research_completed", f"{len(ctx.research.findings)} findings")
+
+    # 3. Domain Expert
+    domain_prompt = (
+        f"TaskPlan:\n{ctx.task_plan.model_dump_json(indent=2)}\n\n"
+        f"ResearchFindings:\n{ctx.research.model_dump_json(indent=2)}"
+    )
+    result = Runner.run_sync(domain_expert_agent, domain_prompt, context=ctx)
+    ctx.domain_analysis = result.final_output_as(DomainAnalysis)
+    ctx.log("domain_expert_agent", "analysis_completed")
+
+    # 4. Execution
+    execution_prompt = (
+        f"TaskPlan:\n{ctx.task_plan.model_dump_json(indent=2)}\n\n"
+        f"DomainAnalysis:\n{ctx.domain_analysis.model_dump_json(indent=2)}"
+    )
+    result = Runner.run_sync(execution_agent, execution_prompt, context=ctx)
+    ctx.execution_result = result.final_output_as(ExecutionResult)
+    ctx.log("execution_agent", "execution_modelled", f"recommended: {ctx.execution_result.recommended_scenario}")
+
+    # --- HUMAN APPROVAL GATE 1: before treating the modelled scenario as real ---
+    approved = human_approval_gate(
+        ctx,
+        "execution_scenarios",
+        f"Execution Agent recommends: '{ctx.execution_result.recommended_scenario}'\n"
+        f"Scenarios modelled: {[s.name for s in ctx.execution_result.scenarios]}",
+    )
+    if not approved:
+        ctx.log("orchestrator", "run_halted", "execution scenarios not approved")
+        return ctx
+
+    # 5. Reviewer (retry loop)
+    for attempt in range(1, config.MAX_REVIEW_RETRIES + 2):
+        review_prompt = (
+            f"TaskPlan:\n{ctx.task_plan.model_dump_json(indent=2)}\n\n"
+            f"ResearchFindings:\n{ctx.research.model_dump_json(indent=2)}\n\n"
+            f"DomainAnalysis:\n{ctx.domain_analysis.model_dump_json(indent=2)}\n\n"
+            f"ExecutionResult:\n{ctx.execution_result.model_dump_json(indent=2)}"
+        )
+        result = Runner.run_sync(reviewer_agent, review_prompt, context=ctx)
+        ctx.review = result.final_output_as(ReviewResult)
+        ctx.log("reviewer_agent", "review_completed", f"approved={ctx.review.approved}, attempt={attempt}")
+        if ctx.review.approved or attempt > config.MAX_REVIEW_RETRIES:
+            break
+        # Simple retry: re-run execution modelling with reviewer feedback folded in.
+        execution_prompt += f"\n\nReviewer feedback to address: {ctx.review.issues_found}"
+        result = Runner.run_sync(execution_agent, execution_prompt, context=ctx)
+        ctx.execution_result = result.final_output_as(ExecutionResult)
+
+    if not ctx.review.approved:
+        ctx.log("orchestrator", "run_halted", "reviewer did not approve after retries")
+        return ctx
+
+    # 6. Report Generator
+    report_prompt = (
+        f"TaskPlan:\n{ctx.task_plan.model_dump_json(indent=2)}\n\n"
+        f"ResearchFindings:\n{ctx.research.model_dump_json(indent=2)}\n\n"
+        f"DomainAnalysis:\n{ctx.domain_analysis.model_dump_json(indent=2)}\n\n"
+        f"ExecutionResult:\n{ctx.execution_result.model_dump_json(indent=2)}\n\n"
+        f"ReviewResult:\n{ctx.review.model_dump_json(indent=2)}"
+    )
+    result = Runner.run_sync(report_generator_agent, report_prompt, context=ctx)
+    ctx.report = result.final_output_as(ExecutiveReport)
+    ctx.log("report_generator_agent", "report_drafted", ctx.report.title)
+
+    # --- HUMAN APPROVAL GATE 2: before the report is dispatched ---
+    approved = human_approval_gate(
+        ctx,
+        "final_report_dispatch",
+        f"Title: {ctx.report.title}\n\nSummary: {ctx.report.executive_summary}\n\n"
+        f"Recommendation: {ctx.report.recommendation}",
+    )
+    if approved:
+        send_notification("slack", f"{ctx.report.title}\n\n{ctx.report.executive_summary}")
+        ctx.log("orchestrator", "report_dispatched")
+    else:
+        ctx.log("orchestrator", "report_dispatch_declined")
+
+    return ctx
