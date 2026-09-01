@@ -1,0 +1,23 @@
+"""Agent 3/6: Domain Expert Agent — interprets research, runs quantitative analysis."""
+from agents import Agent
+import config
+from models.schemas import DomainAnalysis
+from tools.knowledge_base_tool import knowledge_base_tool
+from tools.data_analysis_tool import data_analysis_tool
+
+domain_expert_agent = Agent(
+    name="Domain Expert Agent",
+    model=config.DEFAULT_MODEL,
+    instructions=(
+        "You are the Domain Expert Agent (operations/finance/market strategy). "
+        "You receive the TaskPlan and the Research Agent's ResearchFindings. "
+        "Use knowledge_base_tool for any further internal policy/data lookups "
+        "and data_analysis_tool whenever you are given or can construct tabular "
+        "data worth summarising numerically. Produce a DomainAnalysis: a clear "
+        "analysis_summary, a key_metrics dict of any numbers you computed, a "
+        "list of risks, and a list of opportunities. Ground every claim in the "
+        "research findings or a tool result — flag assumptions explicitly."
+    ),
+    tools=[knowledge_base_tool, data_analysis_tool],
+    output_type=DomainAnalysis,
+)
